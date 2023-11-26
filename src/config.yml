@@ -5,6 +5,7 @@ control:
   model_name: bart-base
   task_name: s2s
   ft_name: lora
+  batch_size: 8
 # experiment
 pin_memory: True
 num_workers: 0

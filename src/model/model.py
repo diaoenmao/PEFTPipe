@@ -2,15 +2,22 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+import model
+from torchvision import transforms
 from transformers import get_linear_schedule_with_warmup
 from config import cfg
+from diffusers import DDPMScheduler
 from .huggingface import make_hf_model
 from peft import get_peft_model, TaskType, LoraConfig, AdaLoraConfig, IA3Config, PromptTuningInit, \
     PromptTuningConfig, PrefixTuningConfig, PromptEncoderConfig
 
 
-def make_model(model_name):
-    model, tokenizer = make_hf_model(model_name)
+def make_model(model_name, sub_model_name=None):
+    if cfg['task_name'] in ['s2s', 'sc', 'clm', 't2i']:
+        model, tokenizer = make_hf_model(model_name, sub_model_name)
+    else:
+        model = eval('model.{}()'.format(model_name))
+        tokenizer = None
     return model, tokenizer
 
 
@@ -63,21 +70,6 @@ def init_param(m):
     return m
 
 
-def make_batchnorm(m, momentum, track_running_stats):
-    if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d)):
-        m.momentum = momentum
-        m.track_running_stats = track_running_stats
-        if track_running_stats:
-            m.register_buffer('running_mean', torch.zeros(m.num_features, device=cfg['device']))
-            m.register_buffer('running_var', torch.ones(m.num_features, device=cfg['device']))
-            m.register_buffer('num_batches_tracked', torch.tensor(0, dtype=torch.long, device=cfg['device']))
-        else:
-            m.running_mean = None
-            m.running_var = None
-            m.num_batches_tracked = None
-    return m
-
-
 def make_optimizer(parameters, tag):
     if cfg[tag]['optimizer_name'] == 'SGD':
         optimizer = optim.SGD(parameters, lr=cfg[tag]['lr'], momentum=cfg[tag]['momentum'],
@@ -95,9 +87,17 @@ def make_optimizer(parameters, tag):
     return optimizer
 
 
+class NoOpScheduler(torch.optim.lr_scheduler._LRScheduler):
+    def __init__(self, optimizer, last_epoch=-1):
+        super(NoOpScheduler, self).__init__(optimizer, last_epoch)
+
+    def get_lr(self):
+        return [group['lr'] for group in self.optimizer.param_groups]
+
+
 def make_scheduler(optimizer, tag):
     if cfg[tag]['scheduler_name'] == 'None':
-        scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=[65535])
+        scheduler = NoOpScheduler(optimizer)
     elif cfg[tag]['scheduler_name'] == 'StepLR':
         scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=cfg[tag]['step_size'], gamma=cfg[tag]['factor'])
     elif cfg[tag]['scheduler_name'] == 'MultiStepLR':
@@ -106,7 +106,9 @@ def make_scheduler(optimizer, tag):
     elif cfg[tag]['scheduler_name'] == 'ExponentialLR':
         scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.99)
     elif cfg[tag]['scheduler_name'] == 'CosineAnnealingLR':
-        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg[tag]['num_epochs'], eta_min=0)
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg['num_steps']['train'] *
+                                                                          cfg[cfg['model_name']]['num_epochs'],
+                                                         eta_min=0)
     elif cfg[tag]['scheduler_name'] == 'ReduceLROnPlateau':
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=cfg[tag]['factor'],
                                                          patience=cfg[tag]['patience'], verbose=False,
@@ -115,12 +117,31 @@ def make_scheduler(optimizer, tag):
     elif cfg[tag]['scheduler_name'] == 'CyclicLR':
         scheduler = optim.lr_scheduler.CyclicLR(optimizer, base_lr=cfg[tag]['lr'], max_lr=10 * cfg[tag]['lr'])
     elif cfg[tag]['scheduler_name'] == 'LinearAnnealingLR':
-        scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=0,
+        scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=int(
+            cfg['num_steps']['train'] * cfg[cfg['model_name']]['num_epochs'] * cfg[tag]['warmup_ratio']),
                                                     num_training_steps=cfg['num_steps']['train'] *
                                                                        cfg[cfg['model_name']]['num_epochs'])
+    elif cfg[tag]['scheduler_name'] == 'ConstantLR':
+        scheduler = optim.lr_scheduler.ConstantLR(optimizer, factor=cfg[tag]['factor'])
     else:
         raise ValueError('Not valid scheduler name')
     return scheduler
+
+
+def make_noise_scheduler(tag):
+    if 'noise_scheduler_name' not in cfg[tag]:
+        raise ValueError('Not valid noise scheduler name')
+
+    if cfg[tag]['noise_scheduler_name'] == 'DDPM':
+        noise_scheduler = DDPMScheduler(
+            beta_start=cfg[tag]['beta_start'],
+            beta_end=cfg[tag]['beta_end'],
+            beta_schedule=cfg[tag]['beta_schedule'],
+            num_train_timesteps=cfg[tag]['num_train_timesteps'],
+        )
+    else:
+        raise ValueError('Not valid noise scheduler name')
+    return noise_scheduler
 
 
 def make_ft_model(model):
@@ -130,6 +151,10 @@ def make_ft_model(model):
         peft_config = make_config_s2s()
     elif cfg['task_name'] == 'sc':
         peft_config = make_config_sc()
+    # elif cfg['task_name'] == 't2i':
+    #     peft_config = make_config_t2i()
+    elif cfg['task_name'] == 'ic':
+        peft_config = make_config_ic(model)
     else:
         raise ValueError('Not valid task name')
     model = get_peft_model(model, peft_config)
@@ -138,19 +163,22 @@ def make_ft_model(model):
 
 def make_config_clm():
     if cfg['ft_name'] == 'lora':
-        peft_config = LoraConfig(task_type=TaskType.CAUSAL_LM, inference_mode=False, r=8, lora_alpha=32,
-                                 lora_dropout=0.1)
+        peft_config = LoraConfig(
+            task_type=TaskType.CAUSAL_LM,
+            r=8,
+            lora_alpha=8,
+            lora_dropout=0.0,
+            inference_mode=False,
+        )
     elif cfg['ft_name'] == 'adalora':
         peft_config = AdaLoraConfig(
-            init_r=12,
+            init_r=64,
             target_r=8,
             beta1=0.85,
             beta2=0.85,
-            # tinit=200,
-            # tfinal=1000,
             deltaT=10,
-            lora_alpha=32,
-            lora_dropout=0.1,
+            lora_alpha=8,
+            lora_dropout=0.0,
             task_type=TaskType.CAUSAL_LM,
             inference_mode=False,
         )
@@ -161,7 +189,7 @@ def make_config_clm():
             task_type=TaskType.CAUSAL_LM,
             prompt_tuning_init=PromptTuningInit.TEXT,
             num_virtual_tokens=20,
-            prompt_tuning_init_text=" ",  # Classify if the tweet is a complaint or not:
+            prompt_tuning_init_text="Label: ",
             tokenizer_name_or_path=cfg['tokenizer_name_or_path'],
         )
     elif cfg['ft_name'] == 'prefixtune':
@@ -178,23 +206,20 @@ def make_config_s2s():
     if cfg['ft_name'] == 'lora':
         peft_config = LoraConfig(
             task_type=TaskType.SEQ_2_SEQ_LM,
-            r=64,
-            lora_alpha=32,
-            # target_modules=["q_proj", "v_proj"],
-            lora_dropout=0.01,
-            bias="none",
+            r=8,
+            lora_alpha=8,
+            lora_dropout=0.0,
+            inference_mode=False,
         )
     elif cfg['ft_name'] == 'adalora':
         peft_config = AdaLoraConfig(
-            init_r=12,
+            init_r=64,
             target_r=8,
             beta1=0.85,
             beta2=0.85,
-            # tinit=200,
-            # tfinal=1000,
             deltaT=10,
-            lora_alpha=32,
-            lora_dropout=0.1,
+            lora_alpha=8,
+            lora_dropout=0.0,
             task_type=TaskType.SEQ_2_SEQ_LM,
             inference_mode=False,
         )
@@ -205,7 +230,7 @@ def make_config_s2s():
             task_type=TaskType.SEQ_2_SEQ_LM,
             prompt_tuning_init=PromptTuningInit.TEXT,
             num_virtual_tokens=20,
-            prompt_tuning_init_text=" ",  # "What is the sentiment of this article?\n"
+            prompt_tuning_init_text="Label: ",
             inference_mode=False,
             tokenizer_name_or_path=cfg['tokenizer_name_or_path'],
         )
@@ -223,23 +248,20 @@ def make_config_sc():
     if cfg['ft_name'] == 'lora':
         peft_config = LoraConfig(
             task_type=TaskType.SEQ_CLS,
-            r=64,
-            lora_alpha=32,
-            # target_modules=["q_proj", "v_proj"],
-            lora_dropout=0.01,
-            bias="none",
+            r=8,
+            lora_alpha=8,
+            lora_dropout=0.0,
+            inference_mode=False,
         )
     elif cfg['ft_name'] == 'adalora':
         peft_config = AdaLoraConfig(
-            init_r=12,
+            init_r=64,
             target_r=8,
             beta1=0.85,
             beta2=0.85,
-            # tinit=200,
-            # tfinal=1000,
             deltaT=10,
-            lora_alpha=32,
-            lora_dropout=0.1,
+            lora_alpha=8,
+            lora_dropout=0.0,
             task_type=TaskType.SEQ_CLS,
             inference_mode=False,
         )
@@ -250,7 +272,7 @@ def make_config_sc():
             task_type=TaskType.SEQ_CLS,
             prompt_tuning_init=PromptTuningInit.TEXT,
             num_virtual_tokens=20,
-            prompt_tuning_init_text=" ",  # "What is the sentiment of this article?\n"
+            prompt_tuning_init_text="Label: ",
             inference_mode=False,
             tokenizer_name_or_path=cfg['tokenizer_name_or_path'],
         )
@@ -262,3 +284,40 @@ def make_config_sc():
     else:
         raise ValueError('Not valid ft name')
     return peft_config
+
+
+def make_config_ic(model):
+    target_modules = []
+    for k, v in model.named_modules():
+        if isinstance(v, (nn.Linear, nn.Conv1d, nn.Conv2d)):
+            target_modules.append(k)
+    if cfg['ft_name'] == 'lora':
+        peft_config = LoraConfig(
+            target_modules=target_modules,
+            r=8,
+            lora_alpha=8,
+            lora_dropout=0.0,
+            inference_mode=False,
+        )
+    else:
+        raise ValueError('Not valid ft name')
+    return peft_config
+
+# def make_config_t2i():
+#     model_name = cfg['model_name']
+#     if cfg['ft_name'] == 'lora':
+#         peft_config = LoraConfig(
+#             target_modules=UNET_TO_LORA_TARGET_MODULES_MAPPING,
+#             r=8,
+#             lora_alpha=8,
+#             lora_dropout=0.0,
+#             inference_mode=False,
+#         )
+#     elif cfg['ft_name'] == 'cola':
+#         peft_config = ColaConfig(
+#             target_modules=UNET_TO_COLA_TARGET_MODULES_MAPPING,
+#             inference_mode=False,
+#         )
+#     else:
+#         raise ValueError('Not valid ft name')
+#     return peft_config

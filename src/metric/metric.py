@@ -6,30 +6,24 @@ from config import cfg
 from module import recur
 
 
-def make_metric(metric_name):
-    if cfg['data_name'] in ['MNIST', 'FashionMNIST', 'SVHN', 'CIFAR10', 'CIFAR100']:
-        pivot = -float('inf')
-        pivot_direction = 'up'
-        pivot_name = 'Accuracy'
-        for k in metric_name:
-            metric_name[k].extend(['Accuracy'])
+def make_metric(metric_name, tokenizer):
     if cfg['task_name'] == 'clm':
-        if cfg['data_name'] in ['raft']:
-            pivot = float('inf')
-            pivot_direction = 'down'
-            pivot_name = 'Perplexity'
-            for k in metric_name:
-                metric_name[k].extend(['Perplexity'])
+        if cfg['data_name'] in ['dolly']:
+            pivot = -float('inf')
+            pivot_direction = 'up'
+            pivot_name = 'ROUGE'
+            metric_name['train'].extend(['Perplexity'])
+            metric_name['test'].extend(['ROUGE'])
         else:
             raise ValueError('Not valid data name')
     elif cfg['task_name'] == 's2s':
-        if cfg['data_name'] in ['fpb']:
+        if cfg['data_name'] in ['fpb', 'wikisql', 'samsum', 'e2enlg', 'webnlg', 'dart']:
             pivot = -float('inf')
             pivot_direction = 'up'
-            pivot_name = 'Accuracy'
+            pivot_name = 'ROUGE'
             for k in metric_name:
                 metric_name[k].extend(['Accuracy'])
-                # metric_name[k].extend(['Rouge'])
+            metric_name['test'].extend(['ROUGE'])
         else:
             raise ValueError('Not valid data name')
     elif cfg['task_name'] == 'sc':
@@ -40,10 +34,28 @@ def make_metric(metric_name):
             metric_name['test'].extend(['GLUE'])
         else:
             raise ValueError('Not valid data name')
+    elif cfg['task_name'] == 'ic':
+        pivot = -float('inf')
+        pivot_direction = 'up'
+        pivot_name = 'Accuracy'
+        for k in metric_name:
+            metric_name[k].extend(['Accuracy'])
+    elif cfg['task_name'] == 't2i':
+        if cfg['data_name'] in ['dreambooth']:
+            pivot = float('inf')
+            pivot_direction = 'down'
+            pivot_name = 'Loss'
+        else:
+            raise ValueError('Not valid data name')
     else:
         raise ValueError('Not valid task name')
-    metric = Metric(metric_name, pivot, pivot_direction, pivot_name)
+    metric = Metric(metric_name, pivot, pivot_direction, pivot_name, tokenizer)
     return metric
+
+
+def Loss(output):
+    loss = output.item()
+    return loss
 
 
 def Perplexity(output):
@@ -71,31 +83,79 @@ def RMSE(output, target):
 class GLUE:
     def __init__(self, subset_name):
         self.metric = evaluate.load('glue', subset_name)
+        self.subset_name = subset_name
 
     def add(self, input, output):
-        predictions = output['target'].argmax(dim=-1)
+        if self.subset_name in ['stsb']:
+            predictions = output['target']
+        else:
+            predictions = output['target'].argmax(dim=-1)
         references = input['target']
         self.metric.add_batch(predictions=predictions, references=references)
         return
 
     def __call__(self, *args, **kwargs):
         glue = self.metric.compute()
-        glue = sum(glue.values()) / len(glue)
+        metric_name = list(glue.keys())[0]
+        glue = glue[metric_name]
         return glue
 
 
+class ROUGE:
+    def __init__(self, tokenizer, split_metric):
+        self.split_metric = split_metric
+        if cfg['dist_mode'] in ['alone', 'col'] and self.split_metric:
+            self.metric = [evaluate.load('rouge') for _ in range(cfg['num_split'])]
+        else:
+            self.metric = evaluate.load('rouge')
+        self.tokenizer = tokenizer
+
+    def decode(self, generate, target):
+        generate = generate[:, -cfg['max_new_tokens']:]
+        target[target < 0] = cfg['pad_token_id']
+        generate = self.tokenizer.batch_decode(generate.detach().cpu().numpy(), skip_special_tokens=True)
+        target = self.tokenizer.batch_decode(target.detach().cpu().numpy(), skip_special_tokens=True)
+        return generate, target
+
+    def add(self, input, output):
+        if cfg['dist_mode'] in ['alone', 'col'] and self.split_metric:
+            for i in range(cfg['num_split']):
+                generate_i = output['generate'][i]
+                if generate_i is None:
+                    continue
+                target_i = input['target'][i]
+                generate_i, target_i = self.decode(generate_i, target_i)
+                self.metric[i].add_batch(predictions=generate_i, references=target_i)
+        else:
+            generate = output['generate']
+            target = input['target']
+            generate, target = self.decode(generate, target)
+            self.metric.add_batch(predictions=generate, references=target)
+        return
+
+    def __call__(self, *args, **kwargs):
+        if cfg['dist_mode'] in ['alone', 'col'] and self.split_metric:
+            rouge = []
+            for i in range(cfg['num_split']):
+                rouge_i = self.metric[i].compute()['rougeL']
+                rouge.append(rouge_i)
+        else:
+            rouge = self.metric.compute()['rougeL']
+        return rouge
+
+
 class Metric:
-    def __init__(self, metric_name, pivot, pivot_direction, pivot_name):
+    def __init__(self, metric_name, pivot, pivot_direction, pivot_name, tokenizer):
         self.pivot, self.pivot_name, self.pivot_direction = pivot, pivot_name, pivot_direction
         self.metric_name = metric_name
-        self.metric = self.make_metric(metric_name)
+        self.metric = self.make_metric(metric_name, tokenizer)
 
-    def make_metric(self, metric_name):
+    def make_metric(self, metric_name, tokenizer):
         metric = defaultdict(dict)
         for split in metric_name:
             for m in metric_name[split]:
                 if m == 'Loss':
-                    metric[split][m] = {'mode': 'batch', 'metric': (lambda input, output: output['loss'].item())}
+                    metric[split][m] = {'mode': 'batch', 'metric': (lambda input, output: recur(Loss, output['loss']))}
                 elif m == 'Perplexity':
                     metric[split][m] = {'mode': 'batch', 'metric': (lambda input,
                                                                            output: recur(Perplexity, output['loss']))}
@@ -107,9 +167,10 @@ class Metric:
                     metric[split][m] = {'mode': 'batch',
                                         'metric': (
                                             lambda input, output: recur(RMSE, output['target'], input['target']))}
+                elif m == 'ROUGE':
+                    metric[split][m] = {'mode': 'full', 'metric': ROUGE(tokenizer, cfg['split_metric'])}
                 elif m == 'GLUE':
-                    metric[split][m] = {'mode': 'full',
-                                        'metric': GLUE(cfg['hf_subset_name'])}
+                    metric[split][m] = {'mode': 'full', 'metric': GLUE(cfg['hf_subset_name'])}
                 else:
                     raise ValueError('Not valid metric name')
         return metric

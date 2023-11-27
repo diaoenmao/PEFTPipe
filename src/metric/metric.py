@@ -102,12 +102,8 @@ class GLUE:
 
 
 class ROUGE:
-    def __init__(self, tokenizer, split_metric):
-        self.split_metric = split_metric
-        if cfg['dist_mode'] in ['alone', 'col'] and self.split_metric:
-            self.metric = [evaluate.load('rouge') for _ in range(cfg['num_split'])]
-        else:
-            self.metric = evaluate.load('rouge')
+    def __init__(self, tokenizer):
+        self.metric = evaluate.load('rouge')
         self.tokenizer = tokenizer
 
     def decode(self, generate, target):
@@ -118,29 +114,14 @@ class ROUGE:
         return generate, target
 
     def add(self, input, output):
-        if cfg['dist_mode'] in ['alone', 'col'] and self.split_metric:
-            for i in range(cfg['num_split']):
-                generate_i = output['generate'][i]
-                if generate_i is None:
-                    continue
-                target_i = input['target'][i]
-                generate_i, target_i = self.decode(generate_i, target_i)
-                self.metric[i].add_batch(predictions=generate_i, references=target_i)
-        else:
-            generate = output['generate']
-            target = input['target']
-            generate, target = self.decode(generate, target)
-            self.metric.add_batch(predictions=generate, references=target)
+        generate = output['generate']
+        target = input['target']
+        generate, target = self.decode(generate, target)
+        self.metric.add_batch(predictions=generate, references=target)
         return
 
     def __call__(self, *args, **kwargs):
-        if cfg['dist_mode'] in ['alone', 'col'] and self.split_metric:
-            rouge = []
-            for i in range(cfg['num_split']):
-                rouge_i = self.metric[i].compute()['rougeL']
-                rouge.append(rouge_i)
-        else:
-            rouge = self.metric.compute()['rougeL']
+        rouge = self.metric.compute()['rougeL']
         return rouge
 
 
@@ -168,7 +149,7 @@ class Metric:
                                         'metric': (
                                             lambda input, output: recur(RMSE, output['target'], input['target']))}
                 elif m == 'ROUGE':
-                    metric[split][m] = {'mode': 'full', 'metric': ROUGE(tokenizer, cfg['split_metric'])}
+                    metric[split][m] = {'mode': 'full', 'metric': ROUGE(tokenizer)}
                 elif m == 'GLUE':
                     metric[split][m] = {'mode': 'full', 'metric': GLUE(cfg['hf_subset_name'])}
                 else:

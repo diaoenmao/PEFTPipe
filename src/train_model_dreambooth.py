@@ -88,8 +88,6 @@ def train(data_loader, unet, vae, text_encoder, optimizer, scheduler, noise_sche
     text_encoder.train(False)
     start_time = time.time()
     for i, input in enumerate(data_loader):
-        if cfg['test_computation']:
-            s = time.time()
         input = to_device(input, cfg['device'])
         with torch.no_grad():
             latents = vae.encode(input["pixel_values"].to(dtype=torch.float32)).latent_dist.sample()
@@ -141,11 +139,9 @@ def train(data_loader, unet, vae, text_encoder, optimizer, scheduler, noise_sche
         output_ = {'loss': loss}
         input_size = input['input_ids'].size(0) / 2
         optimizer.zero_grad()
-        output['loss'].backward()
+        output_['loss'].backward()
         optimizer.step()
         scheduler.step()
-        if cfg['test_computation']:
-            cfg['time_used'].append(time.time() - s)
         evaluation = metric.evaluate('train', 'batch', None, output_)
         logger.append(evaluation, 'train', n=input_size)
         if i % int((len(data_loader) * cfg['log_interval']) + 1) == 0:
@@ -160,18 +156,6 @@ def train(data_loader, unet, vae, text_encoder, optimizer, scheduler, noise_sche
                              'Experiment Finished Time: {}'.format(exp_finished_time)]}
             logger.append(info, 'train')
             print(logger.write('train', metric.metric_name['train']), flush=True)
-        if cfg['test_computation']:
-            mem_free, mem_total = torch.cuda.mem_get_info(cfg['device'])
-            cfg['mem_used'].append(mem_total - mem_free)
-            if i == cfg['num_test_iter']:
-                print(cfg['time_used'])
-                print(cfg['mem_used'])
-                print('Run time backward: {}({})'.format(np.mean(cfg['time_used'][1:]),
-                                                         np.std(cfg['time_used'][1:])))
-                print('Memory used: {}({})'.format(np.mean(cfg['mem_used'][1:]),
-                                                   np.std(cfg['mem_used'][1:])))
-                print('-----------------')
-                exit()
     logger.save(True)
     return
 

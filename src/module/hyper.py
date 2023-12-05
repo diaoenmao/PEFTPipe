@@ -85,6 +85,9 @@ def process_control():
 
         cfg[model_name]['num_inference_steps'] = 50
         cfg[model_name]['guidance_scale'] = 7.5
+
+        cfg[model_name]['UNET_TO_COLA_TARGET_MODULES_MAPPING'] = ["to_q", "to_v", "query", "value"]
+        cfg[model_name]['UNET_TO_LORA_TARGET_MODULES_MAPPING'] = ["to_q", "to_v", "query", "value"]
     else:
         raise ValueError('Not valid task name')
     return

@@ -151,8 +151,8 @@ def make_ft_model(model):
         peft_config = make_config_s2s()
     elif cfg['task_name'] == 'sc':
         peft_config = make_config_sc()
-    # elif cfg['task_name'] == 't2i':
-    #     peft_config = make_config_t2i()
+    elif cfg['task_name'] == 't2i':
+        peft_config = make_config_t2i()
     elif cfg['task_name'] == 'ic':
         peft_config = make_config_ic(model)
     else:
@@ -303,21 +303,15 @@ def make_config_ic(model):
         raise ValueError('Not valid ft name')
     return peft_config
 
-# def make_config_t2i():
-#     model_name = cfg['model_name']
-#     if cfg['ft_name'] == 'lora':
-#         peft_config = LoraConfig(
-#             target_modules=UNET_TO_LORA_TARGET_MODULES_MAPPING,
-#             r=8,
-#             lora_alpha=8,
-#             lora_dropout=0.0,
-#             inference_mode=False,
-#         )
-#     elif cfg['ft_name'] == 'cola':
-#         peft_config = ColaConfig(
-#             target_modules=UNET_TO_COLA_TARGET_MODULES_MAPPING,
-#             inference_mode=False,
-#         )
-#     else:
-#         raise ValueError('Not valid ft name')
-#     return peft_config
+def make_config_t2i():
+    if cfg['ft_name'] == 'lora':
+        peft_config = LoraConfig(
+            target_modules=cfg[cfg['model_name']]['UNET_TO_LORA_TARGET_MODULES_MAPPING'],
+            r=8,
+            lora_alpha=8,
+            lora_dropout=0.0,
+            inference_mode=False,
+        )
+    else:
+        raise ValueError('Not valid ft name')
+    return peft_config
